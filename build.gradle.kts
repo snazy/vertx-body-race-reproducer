@@ -8,7 +8,7 @@ repositories {
     mavenLocal()
 }
 
-// Default to Vert.x 5; override with -PvertxVersion=4.5.25
+// Default to Vert.x 5.0.8; override with -PvertxVersion=4.5.25
 val vertxVersion = project.findProperty("vertxVersion")?.toString() ?: "5.0.8"
 
 dependencies {

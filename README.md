@@ -7,8 +7,9 @@ in a `.compose()` chain after `HttpClient.request().compose(req -> req.send())`.
 The `Future` returned by `body()` is never completed, causing the caller to
 time out.
 
-Affects **Vert.x 4.5.x** and **5.0.x**. Observed at a rate of roughly
-**0.02 %** per request on an idle system with loopback networking.
+Affects **Vert.x 4.5.x** and **5.0.x**. The natural race can be quite rare
+(machine / scheduling dependent), so the reproducer now probes the internal
+response state and only calls `body()` once the buggy state is observed.
 
 ## Root cause
 
@@ -89,7 +90,7 @@ the following sequence can occur:
    will not fire again.
 10. The caller times out.
 
-### Why it is rare
+### Why natural reproduction is rare
 
 Steps 2–8 must interleave in a specific order. With
 `setEventLoopPoolSize(1)`, the event loop handles both the I/O completion
@@ -98,13 +99,32 @@ loopback, small responses arrive in a single read cycle, which increases
 the chance that the `InboundMessageQueue` drains the end message before the
 compose callback is dispatched.
 
+### How this reproducer makes it likely
+
+Instead of calling `resp.body()` immediately in the compose callback, the test
+waits until `HttpClientResponseImpl` has:
+
+- `trailers != null` (its internal `handleEnd(...)` already ran)
+- `eventHandler == null` (body/end handler still not created)
+
+Then it invokes `resp.body()`.
+
+This targets the exact problematic state directly:
+
+```java
+request.send()
+  .compose(HttpClientResponseBodyRaceTest::invokeBodyAfterEndWithoutHandler);
+```
+
+With this, affected versions fail quickly and consistently.
+
 ## Affected response types
 
 | Response | Reproducible? | Why |
 |---|---|---|
-| 204 No Content (no body) | ✅ most frequent | Headers + `LastHttpContent` in one read cycle |
-| 200 + small JSON body | ✅ less frequent | Headers + body + `LastHttpContent` in one TCP segment |
-| 200 + large body | ❌ not observed | Body chunks arrive over multiple read cycles; `body()` is called before the last chunk |
+| 204 No Content (no body) | ✅ deterministic | End is processed before `body()` is invoked |
+| 200 + small JSON body | ✅ deterministic | Same dropped-end state, then `body()` is invoked |
+| 200 + large body | ⚪ not covered here | Current fixture only serves tiny body / no body responses |
 
 ## How to reproduce
 
@@ -116,9 +136,24 @@ compose callback is dispatched.
 ./gradlew test --rerun -PvertxVersion=4.5.25
 ```
 
-The test runs 50 000 iterations × multiple HTTP methods. With
-`setEventLoopPoolSize(1)`, it typically fails within a few thousand
-requests.
+Useful knobs:
+
+```bash
+# Number of loop iterations per scenario (default: 5000)
+./gradlew test --rerun -Dreproducer.iterations=10000
+
+# Request timeout used by the reproducer in ms (default: 1000)
+./gradlew test --rerun -Dreproducer.timeoutMs=500
+
+# Max wait for "trailers != null && eventHandler == null" (default: 200)
+./gradlew test --rerun -Dreproducer.waitForEndMs=500
+
+# Poll interval used while waiting for ended state (default: 1)
+./gradlew test --rerun -Dreproducer.pollIntervalMs=1
+
+# Vert.x event loop pool size used by the test JVM (default: 1)
+./gradlew test --rerun -Dreproducer.eventLoopPoolSize=2
+```
 
 ## Possible fix
 
